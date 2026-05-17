@@ -137,6 +137,10 @@ struct Args {
     #[arg(long)]
     ensemble_provider: Option<String>,
 
+    /// Second model for ensemble mode (defaults to provider's default model)
+    #[arg(long)]
+    ensemble_model: Option<String>,
+
     /// Strict mode: halt on first error (true zero-error execution)
     #[arg(long, default_value = "false")]
     strict: bool,
@@ -286,9 +290,13 @@ fn main() {
             .expect("Valid parameters");
         println!("k-margin:   {} (fixed)", k);
     } else if let Some(ref ens_provider) = ensemble_provider {
+        let ens_model_display = args
+            .ensemble_model
+            .as_deref()
+            .unwrap_or("<default>");
         println!(
-            "Mode:       Ensemble ({} + {})",
-            args.provider, ens_provider
+            "Mode:       Ensemble ({}:{} + {}:{})",
+            args.provider, model_name, ens_provider, ens_model_display
         );
         println!(
             "k-margin:   Adaptive (min={}, max={})",
@@ -333,6 +341,7 @@ fn main() {
             &args.provider,
             &model_name,
             ensemble_provider.as_deref(),
+            args.ensemble_model.as_deref(),
             &config,
             args.strict,
         ) {
@@ -479,6 +488,39 @@ impl HanoiTowers {
         }
     }
 
+    /// Return all legal moves in the current state as "move N from X to Y" strings
+    fn legal_moves(&self) -> Vec<String> {
+        let pegs: [(&str, &Vec<u8>); 3] = [("A", &self.a), ("B", &self.b), ("C", &self.c)];
+        let mut moves = Vec::new();
+        for (from_name, from_peg) in &pegs {
+            if let Some(&top_disk) = from_peg.last() {
+                for (to_name, to_peg) in &pegs {
+                    if from_name != to_name {
+                        let can_place = to_peg.last().map_or(true, |&t| top_disk < t);
+                        if can_place {
+                            moves.push(format!(
+                                "move {} from {} to {}",
+                                top_disk, from_name, to_name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        moves
+    }
+
+    /// Return the peg label ("A", "B", or "C") that disk 1 is currently on
+    fn disk1_peg(&self) -> &'static str {
+        if self.a.last() == Some(&1) {
+            "A"
+        } else if self.b.last() == Some(&1) {
+            "B"
+        } else {
+            "C"
+        }
+    }
+
     /// Apply a move to the towers, returns Ok if valid, Err if invalid
     fn apply_move(&mut self, move_str: &str) -> Result<(), String> {
         // Parse "move N from X to Y"
@@ -543,6 +585,7 @@ fn run_llm_mode(
     provider: &str,
     model: &str,
     ensemble_provider: Option<&str>,
+    ensemble_model: Option<&str>,
     config: &HanoiDemoConfig,
     strict: bool,
 ) -> Result<HanoiStats, String> {
@@ -595,7 +638,7 @@ fn run_llm_mode(
 
     // Create ensemble client if secondary provider specified
     let client: Box<dyn LlmClient> = if let Some(ens_provider) = ensemble_provider {
-        let secondary_client = setup_provider_client(ens_provider, None).map_err(&format_error)?;
+        let secondary_client = setup_provider_client(ens_provider, ensemble_model.map(str::to_string)).map_err(&format_error)?;
 
         println!("Testing {} connection...", ens_provider);
         if let Err(e) = secondary_client.generate("test", 0.0) {
@@ -637,38 +680,85 @@ fn run_llm_mode(
         let vote_config =
             VoteConfig::default().with_diversity_temperature(config.voting_temperature);
 
-        // Build prompt with few-shot examples and chain-of-thought
+        // Build structured prompt with pre-computed legal moves
+        let is_odd = (step + 1) % 2 == 1;
+        let all_legal = towers.legal_moves();
+        let disk1_peg = towers.disk1_peg();
+
+        let disk1_moves: Vec<&String> =
+            all_legal.iter().filter(|m| m.starts_with("move 1 ")).collect();
+        let non_disk1_moves: Vec<&String> =
+            all_legal.iter().filter(|m| !m.starts_with("move 1 ")).collect();
+
+        let fmt_peg = |p: &[u8]| -> String {
+            if p.is_empty() {
+                "empty".to_string()
+            } else {
+                p.iter().rev().map(|d| d.to_string()).collect::<Vec<_>>().join(", ")
+            }
+        };
+
+        // Disk 1 cycles A→C→B→A for odd disk count, A→B→C→A for even
+        let cycle = if n_disks % 2 == 1 {
+            "A→C→B→A→..."
+        } else {
+            "A→B→C→A→..."
+        };
+
+        let step_block = if is_odd {
+            format!(
+                "This is an ODD step → you MUST move disk 1 (the smallest disk).\n\
+                 Disk 1 is currently on peg {}.\n\
+                 Legal moves for disk 1:\n{}\n\
+                 Disk 1 follows the cycle {} to reach goal peg C.\n\
+                 Pick the disk-1 move that follows this cycle from peg {}.",
+                disk1_peg,
+                disk1_moves
+                    .iter()
+                    .map(|m| format!("  - {}", m))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                cycle,
+                disk1_peg
+            )
+        } else {
+            format!(
+                "This is an EVEN step → you must NOT move disk 1.\n\
+                 Disk 1 is on peg {} — exclude all moves involving disk 1.\n\
+                 Legal moves that do NOT involve disk 1:\n{}\n\
+                 There is exactly one correct choice. Select it.",
+                disk1_peg,
+                if non_disk1_moves.is_empty() {
+                    "  (none listed)".to_string()
+                } else {
+                    non_disk1_moves
+                        .iter()
+                        .map(|m| format!("  - {}", m))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            )
+        };
+
         let prompt = format!(
-            "Tower of Hanoi: Move all disks from A to C using B as auxiliary.
-
-RULES:
-1. Move one disk at a time (only the top disk)
-2. Never place larger disk on smaller disk
-3. Use the OPTIMAL algorithm: On odd steps move disk 1, on even steps make the only legal non-disk-1 move
-
-EXAMPLE (2 disks):
-State: A:[2,1] B:[] C:[] → Step 1 (odd): move 1 from A to B
-State: A:[2] B:[1] C:[] → Step 2 (even): move 2 from A to C
-State: A:[] B:[1] C:[2] → Step 3 (odd): move 1 from B to C
-Done: A:[] B:[] C:[2,1]
-
-NOW SOLVE:
-Disks: {}
-Step: {} ({})
-State: A:{} B:{} C:{}
-
-Think step by step:
-1. Is this an odd or even step?
-2. If odd: move disk 1 to the next tower in its cycle
-3. If even: find the only legal move that doesn't involve disk 1
-
-Answer with ONLY: move N from X to Y",
-            n_disks,
+            "Tower of Hanoi — Step {} of {} ({})\n\
+             Goal: move all disks from peg A to peg C using peg B as auxiliary.\n\
+             \n\
+             Current state (top disk listed first):\n\
+               Peg A: {}\n\
+               Peg B: {}\n\
+               Peg C: {}\n\
+             \n\
+             {}\n\
+             \n\
+             Answer with ONLY: move N from X to Y",
             step + 1,
-            if (step + 1) % 2 == 1 { "odd" } else { "even" },
-            HanoiTowers::format_tower_full(&towers.a),
-            HanoiTowers::format_tower_full(&towers.b),
-            HanoiTowers::format_tower_full(&towers.c),
+            total_steps,
+            if is_odd { "odd" } else { "even" },
+            fmt_peg(&towers.a),
+            fmt_peg(&towers.b),
+            fmt_peg(&towers.c),
+            step_block
         );
 
         match vote_with_margin_adaptive(
