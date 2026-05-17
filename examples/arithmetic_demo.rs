@@ -25,8 +25,8 @@ use maker::core::{
     MockLlmClient, VoteConfig,
 };
 use maker::llm::adapter::setup_provider_client;
-use rand::Rng;
-use rand::SeedableRng;
+use rand::rngs::SysRng;
+use rand::{Rng, RngExt, SeedableRng};
 use std::env;
 use std::time::Instant;
 
@@ -126,7 +126,7 @@ impl Default for DemoConfig {
     fn default() -> Self {
         Self {
             target_reliability: 0.95,
-            voting_temperature: 0.0,
+            voting_temperature: 1.0,
             pool_size: 100,
             ema_alpha: 0.2,
             initial_p_hat: 0.90, // Arithmetic is generally easier
@@ -140,6 +140,7 @@ impl Default for DemoConfig {
 #[derive(Default, Clone)]
 struct DemoStats {
     errors: usize,
+    completed: usize,
     total_samples: usize,
     total_red_flagged: usize,
 }
@@ -178,11 +179,23 @@ struct Args {
     /// Random seed for reproducible problems
     #[arg(long)]
     seed: Option<u64>,
+
+    /// Maximum k-margin ceiling for adaptive voting
+    #[arg(long, default_value = "10")]
+    k_max: usize,
+
+    /// Minimum k-margin floor for adaptive voting
+    #[arg(long, default_value = "1")]
+    k_min: usize,
 }
 
 fn main() {
     let args = Args::parse();
-    let config = DemoConfig::default();
+    let config = DemoConfig {
+        k_min_floor: args.k_min,
+        k_max_ceiling: args.k_max,
+        ..DemoConfig::default()
+    };
 
     // Validate accuracy
     if args.accuracy <= 0.5 || args.accuracy >= 1.0 {
@@ -208,7 +221,7 @@ fn main() {
     // Generate problems
     let mut rng: rand::rngs::StdRng = match args.seed {
         Some(seed) => rand::SeedableRng::seed_from_u64(seed),
-        None => rand::rngs::StdRng::from_os_rng(),
+        None => rand::rngs::StdRng::try_from_rng(&mut SysRng).unwrap(),
     };
     let problems: Vec<Problem> = (0..args.problems)
         .map(|_| Problem::generate(&mut rng, args.difficulty))
@@ -258,11 +271,7 @@ fn main() {
     };
 
     let elapsed = start.elapsed();
-    let completed = if args.strict && stats.errors > 0 {
-        args.problems - (args.problems - stats.total_samples / 2) // Approximate
-    } else {
-        args.problems
-    };
+    let completed = stats.completed;
 
     println!();
     println!("=== Results ===");
@@ -318,6 +327,7 @@ fn run_mock_mode(
             Ok(result) => {
                 stats.total_samples += result.total_samples;
                 stats.total_red_flagged += result.red_flagged;
+                stats.completed += 1;
 
                 // Normalize answers for comparison (strip whitespace)
                 let voted = result.winner.trim();
@@ -353,6 +363,7 @@ fn run_mock_mode(
             }
             Err(e) => {
                 stats.errors += 1;
+                stats.completed += 1;
                 eprintln!("  FAIL Problem {}: {}", i + 1, e);
                 if strict {
                     eprintln!("  HALTING: Strict mode enabled");
@@ -431,6 +442,7 @@ fn run_llm_mode(
             Ok(result) => {
                 stats.total_samples += result.total_samples;
                 stats.total_red_flagged += result.red_flagged;
+                stats.completed += 1;
 
                 let k_used = result.k_used;
                 let p_hat = k_estimator.p_hat();
@@ -472,6 +484,7 @@ fn run_llm_mode(
             }
             Err(e) => {
                 stats.errors += 1;
+                stats.completed += 1;
                 eprintln!("  FAIL Problem {}: {}", i + 1, e);
                 if strict {
                     eprintln!("  HALTING: Strict mode enabled");

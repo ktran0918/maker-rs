@@ -284,20 +284,15 @@ impl Default for MakerServer {
 #[tool_handler]
 impl ServerHandler for MakerServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: Default::default(),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "maker-mcp".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                ..Default::default()
-            },
-            instructions: Some(
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                "maker-mcp",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
                 "MAKER Framework - Zero-error LLM agent execution via SPRT voting. \
-                 Available tools: maker/vote, maker/validate, maker/calibrate, maker/configure, maker/decompose, maker/health."
-                    .into(),
-            ),
-        }
+                 Available tools: maker/vote, maker/validate, maker/calibrate, maker/configure, maker/decompose, maker/health.",
+            )
     }
 }
 
